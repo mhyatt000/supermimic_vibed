@@ -132,6 +132,75 @@ The first iterations are slow while `torch.compile` builds its kernels (cached i
 Checkpoints are written every 2000 iterations to `logs/<run>/`; the eval watcher scores each on all
 40 clips and appends to `logs/<run>/eval.csv`.
 
+### Without Docker (uv + Slurm)
+
+```bash
+tools/setup_uv.sh                                     # Isaac Lab @ 46d6cc3 + locked dependencies into .venv (uv, ~12 GB)
+SM_PYTHON=tools/uv_run.sh tools/download_data.sh      # LAFAN1 G1 clips, robot model, ground
+tools/uv_run.sh tools/test_env.py                     # on a GPU node
+tools/uv_run.sh supermimic/train.py --log_dir logs/run   # any script: tools/uv_run.sh <script> [args]
+sbatch tools/sbatch_sweep.sh                          # the sweep below: 4 array tasks, one GPU each
+```
+
+The `sbatch_*.sh` scripts carry the partition, node name (`g4`) and sizes of the cluster they were written
+on; edit the `#SBATCH` lines. Runs log to Weights & Biases (`wandb login` first; `--wandb_project`), a
+checkpoint is written every 15 minutes (`--ckpt_every_min`), and the eval watcher scores it on the 40 clips
+and renders a video that the trainer uploads.
+
+`train.py` flags added for the sweep: `--optimizer muon`, `--lr_schedule {cosine,constant}`,
+`--actor_obs {proprio,privileged,privileged_official}` (10 frames of noisy sensor readings; the simulator's
+exact 68-number state; the same with the official repository's goal format), `--init_from <ckpt>` (weights
+only), `--critic_only_iters` (the shipped checkpoint has no critic).
+
+Results, 20,000 iterations each, Muon + Adam, normalised return on the 40 LAFAN1 clips (0 failed in every
+run; the shipped checkpoint the fine-tunes start from scores 0.842):
+
+| Run | Return | Wall time |
+|---|---|---|
+| fine-tune, privileged, cosine, 1 GPU | 0.926 | 1.9 h |
+| fine-tune, proprio, cosine, 4 GPUs, `--lr 4e-4` | 0.924 | 2.0 h |
+| fine-tune, proprio, cosine, 1 GPU | 0.912 | 2.0 h |
+| fine-tune, privileged, constant, 1 GPU | 0.890 | 1.9 h |
+| from scratch, privileged_official, constant, 1 GPU | 0.881 | 1.9 h |
+| fine-tune, proprio, constant, 1 GPU | 0.877 | 2.0 h |
+
+GPUs: RTX PRO 6000 Blackwell. From scratch:
+`INIT= SCHED=constant ACTOR_OBS=privileged_official GROUP=scratch-muon sbatch --array=0 tools/sbatch_sweep.sh`.
+
+### BONES-SEED (untested on the real data)
+
+`tools/sbatch_bones_prep.sh` downloads the G1 retarget of the gated
+[BONES-SEED](https://huggingface.co/datasets/bones-studio/seed) dataset (accept its licence on the dataset
+page first), converts it to a 50 Hz cache and applies the paper's Appendix E filters; train with
+`--motion_dir data/bones_seed/cache`, evaluate a subset with `--eval_clips 2000 --eval_seed 0`. The data is
+not redistributed here. Motion Data by Bones Studio (https://bones.studio/).
+
+### Multi-GPU (one node)
+
+```bash
+jid=$(RUN=proprio_cosine_x4 sbatch --parsable tools/sbatch_ddp.sh --lr 4e-4)                # 4 GPUs of g4, one rank per GPU
+sbatch --dependency=after:$jid tools/sbatch_watch.sh logs/ddp/proprio_cosine_x4_$jid       # eval/video watcher, own 1-GPU job
+```
+
+`train.py` is the same script: started by `torchrun` (`python -m torch.distributed.run --standalone
+--nproc_per_node N supermimic/train.py ...`) it runs as N processes, one per GPU, and `supermimic/dist.py`
+keeps their networks identical. Without `torchrun` nothing changes.
+
+- Every rank has its own simulator, replay buffer, reset-sampling statistics and random stream
+  (seed `--seed + 1000003 * rank`); rank 0 uses the single-GPU stream.
+- Every optimizer step (world model, policy, critic) uses the gradient averaged over the ranks, and every
+  running-normalizer update uses the batch moments pooled over the ranks. The networks are not wrapped, so
+  checkpoints are the single-GPU format (`evaluate.py`, `--resume`, `--init_from` work unchanged).
+- All sizes are per rank (paper Table A.5: 4096 envs per GPU): N ranks collect N x `--num_envs` transitions and
+  fit N x `--wm_batch` / `--pi_batch` samples per iteration, at the same updates per simulator step.
+  `sim_steps` counts all ranks. To split a single-GPU budget instead, divide those three sizes by N.
+- The learning rate is not scaled automatically; the paper scales it by sqrt(N): pass `--lr 4e-4` for 4 GPUs.
+- Rank 0 writes `args.json`, `train_log.csv` (losses and statistics averaged over the ranks), checkpoints,
+  `done` and W&B. At every log row the ranks compare their networks; a difference is reported and repaired.
+- If one rank dies, `torchrun` stops the others and the job fails. NCCL's InfiniBand/RoCE transport is turned
+  off (`NCCL_IB_DISABLE=1`, it segfaults on g4). More ranks than GPUs (functional tests) use gloo.
+- `tools/test_dist.py` checks the synchronisation without the simulator.
+
 ### Trained checkpoint
 
 [`checkpoints/lafan1_g1_it10000.pt`](checkpoints/lafan1_g1_it10000.pt) (71 MB) is the iteration-10000

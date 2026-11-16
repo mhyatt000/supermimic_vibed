@@ -113,7 +113,8 @@ def main():
                 draw.text(xy, txt, fill=(20, 20, 20), font=font)
             ff.stdin.write(np.asarray(img).tobytes())
     ff.stdin.close()
-    ff.wait()
+    if ff.wait() != 0:
+        raise SystemExit(f"ffmpeg failed writing {a.out}")
     print("wrote", a.out)
 
 

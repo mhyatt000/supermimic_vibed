@@ -18,6 +18,7 @@ GOAL_FRAMES = 10
 GOAL_STRIDE = 5
 ACTOR_GOAL_DIM = GOAL_FRAMES * (29 + 29 + 3 + 3 + 3 + 6)
 WM_GOAL_DIM = ACTOR_GOAL_DIM + GOAL_FRAMES * 3
+OFFICIAL_ACTOR_GOAL_DIM = GOAL_FRAMES * (29 + 29) + GOAL_FRAMES * 6  # --actor_obs privileged_official
 
 
 class MotionLib:
@@ -93,6 +94,10 @@ class MotionLib:
 
     @staticmethod
     def from_dir(path: str, kin: G1Kinematics, device: str) -> MotionLib:
+        if os.path.isfile(os.path.join(path, "motion_cache.json")):  # preprocessed large dataset (BONES-SEED)
+            from .motion_cache import CachedMotionLib
+
+            return CachedMotionLib(path, kin, device)
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
         return MotionLib(files, kin, device)
 
@@ -129,6 +134,15 @@ class MotionLib:
         rel_pos = (Rt @ (self.root_p[fut] - p.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1)
         actor = torch.cat((self.q[fut], qd * 0.1, dp, v, w, rel_ori), -1).flatten(-2)
         return actor, torch.cat((actor, rel_pos.flatten(-2)), -1)
+
+    def goal_official(self, f: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+        """The official actor goal (representations.py: motion_goal_window + rel_ori of assemble_anchor_window):
+        window f, f+S, ... clamped to the clip's last frame; per frame joint positions and (unscaled) velocities,
+        then per frame the reference root orientation in the robot root frame (6D)."""
+        end = self.clip_end[self.clip_id[f]].unsqueeze(-1)
+        fut = torch.minimum(f.unsqueeze(-1) + torch.arange(GOAL_FRAMES, device=f.device) * GOAL_STRIDE, end)
+        rel_ori = mat_to_6d(R.transpose(-1, -2).unsqueeze(-3) @ self.root_R[fut])
+        return torch.cat((torch.cat((self.q[fut], self.qd[fut]), -1).flatten(-2), rel_ori.flatten(-2)), -1)
 
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]

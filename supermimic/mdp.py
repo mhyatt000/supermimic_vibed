@@ -78,6 +78,19 @@ def invariant_features(S) -> torch.Tensor:
 INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
 
 
+def rep_state(S) -> torch.Tensor:
+    """The official GenCoord ``rep_state`` (gencoord_helpers.compute_gencoord_state), same order: root height (1),
+    unit gravity direction in the root frame ``R^T (0,0,-1)`` (3), root linear and angular velocity in the root
+    frame (3, 3), absolute joint positions (29), joint velocities (29)."""
+    p, R, v, w, q, qd = S
+    Rt = R.transpose(-1, -2)
+    return torch.cat((p[..., 2:3], -R[..., 2, :], (Rt @ v.unsqueeze(-1)).squeeze(-1), (Rt @ w.unsqueeze(-1)).squeeze(-1), q, qd), -1)
+
+
+REP_DIM = 1 + 3 + 3 + 3 + 29 + 29
+ACTOR_OBS_DIMS = {"proprio": OBS_DIM, "privileged": REP_DIM, "privileged_official": REP_DIM}  # per-frame actor state input
+
+
 class MDP:
     def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg()):
         self.kin, self.motion, self.cfg = kin, motion, cfg
@@ -100,6 +113,15 @@ class MDP:
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
+    def actor_obs(self, S, a_prev, xi, mode: str = "proprio", noise: bool = False) -> torch.Tensor:
+        """Actor state input. ``proprio``: the sensor observation, with Table A.1 noise if ``noise``.
+        ``privileged`` / ``privileged_official``: the noise-free official ``rep_state`` (the official default
+        ``actor_obs="rep_state"``: no last action, no sim context); differentiable w.r.t. ``S``."""
+        if mode != "proprio":
+            return rep_state(S)
+        o = self.obs(S, a_prev, xi)
+        return self.add_noise(o) if noise else o
+
     # ---------------- reward / termination ----------------
     def reward(self, S, f, a, a_prev, terms: bool = False):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f."""
@@ -107,15 +129,17 @@ class MDP:
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
         rp, rR = m.root_p[f], m.root_R[f]
+        # tracked bodies of the reference: stored per frame (MotionLib), or one FK pass (motion_cache.CachedMotionLib)
+        m_bp, m_bR, m_bv, m_bw = m.body_state(f) if hasattr(m, "body_state") else (m.body_p[f], m.body_R[f], m.body_v[f], m.body_w[f])
         # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
         dR = yaw_mat(R @ rR.transpose(-1, -2))
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
-        ref_bR = dR.unsqueeze(-3) @ m.body_R[f]
+        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m_bp - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        ref_bR = dR.unsqueeze(-3) @ m_bR
         e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
         e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
-        e_lv = ((m.body_v[f] - bv) ** 2).sum(-1).mean(-1)
-        e_av = ((m.body_w[f] - bw) ** 2).sum(-1).mean(-1)
+        e_lv = ((m_bv - bv) ** 2).sum(-1).mean(-1)
+        e_av = ((m_bw - bw) ** 2).sum(-1).mean(-1)
         e_rp = ((rp - p) ** 2).sum(-1)
         e_ro = rot_angle_sq(rR, R)
         r_track = (

@@ -20,6 +20,9 @@ def mlp(inp: int, hidden: list[int], out: int) -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
+MOMENT_REDUCE = None  # multi-GPU training (supermimic/dist.py): pools the (n, mean, var) of one update over the ranks
+
+
 class RunningNorm(nn.Module):
     """Running mean/std normalizer; updated from data without gradients, frozen after ``max_count``."""
 
@@ -37,6 +40,8 @@ class RunningNorm(nn.Module):
             return
         n = x.shape[0]
         m, v = x.mean(0), x.var(0, unbiased=False)
+        if MOMENT_REDUCE is not None:
+            n, m, v = MOMENT_REDUCE(n, m, v)
         tot = self.count + n
         delta = m - self.mean
         self.mean += delta * n / tot
